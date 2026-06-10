@@ -1,14 +1,10 @@
 #include <u.h>
 #include <libc.h>
-#include <auth.h>
 #include <fcall.h>
 #include <thread.h>
 #include <9p.h>
-#include <stdio.h>
 
 #include <sys/stat.h>
-
-#undef exits
 
 struct Entry {
 	char *path;
@@ -23,7 +19,12 @@ static char Eseek[] = "cannot seek file";
 static char Eunknown[] = "unknown file";
 static char Eperm[] = "permission denied";
 
-static struct Entry top;
+static struct Entry top = {
+	"",
+	"",
+	nil,
+	&top
+};
 
 int
 threadmaybackground(void)
@@ -39,36 +40,66 @@ tellpath(File *f)
 	for(node = top.next; node != &top; node = node->next)
 		if(node->file == f)
 			return node->path;
-	return NULL;
+	return nil;
 }
 
 void
 buildpath(File *root, char *vp[], int i)
 {
 	struct Entry **node;
+	struct Entry *first;
+	struct Entry *second;
 
 	node = &top.next;
 	while(--i)
 	{
 		Dir *d;
 
-		*node = malloc(sizeof **node);
+		*node = emalloc9p(sizeof **node);
 		(*node)->path = vp[i];
 		d = dirstat((*node)->path);
-		if(d->mode & DMDIR)
+		if(d == nil || d->qid.type & QTDIR)
 		{
 			fprint(2, "%s: invalid file.\n", (*node)->path);
-			exits("invalid file");
+			threadexits("invalid file");
 		}
 		(*node)->name = strrchr((*node)->path, '/') + 1;
-		(*node)->file = createfile(root,
-					   (*node)->name,
-					   nil,
-					   0664,
-					   nil);
 		node = &(*node)->next;
 	}
 	*node = &top;
+	for(first = top.next; first != &top; first = first->next)
+		for(second = first->next;
+		    second != first;
+		    second = second->next)
+			if(strcmp(first->name, second->name) == 0)
+			{
+				fprint(2, "%s: ambiguous.\n", first->name);
+				threadexits("ambiguous");
+			}
+	for(first = top.next; first != &top; first = first->next)
+	{
+		struct stat st;
+		int fd;
+
+		first->file = createfile(root,
+					 first->name,
+					 nil,
+					 0664,
+					 nil);
+		fd = open(first->path, O_RDONLY);
+		if(lseek(fd, (off_t) 0, SEEK_CUR) == -1)
+		{
+			close(fd);
+			continue;
+		}
+		if(fstat(fd, &st) == -1)
+		{
+			close(fd);
+			continue;
+		}
+		close(fd);
+		first->file->dir.length = (vlong) st.st_size;
+	}
 }
 
 static void
@@ -78,24 +109,18 @@ fsread(Req *r)
 	vlong offset;
 	u32int count;
 	char *path;
-	struct stat st;
 	int fd;
 
 	f = r->fid->file;
 	path = tellpath(f);
-	if(path == NULL)
+	if(path == nil)
 	{
 		respond(r, Eunknown);
 		return;
 	}
-	if(stat(path, &st) == -1)
-	{
-		respond(r, Estat);
-		return;
-	}
 	offset = r->ifcall.offset;
 	count = r->ifcall.count;
-	if(offset + count > st.st_size || count == 0)
+	if(count == 0)
 	{
 		r->ofcall.count = 0;
 		respond(r, nil);
@@ -106,12 +131,7 @@ fsread(Req *r)
 		respond(r, Eopen);
 		return;
 	}
-	if(lseek(fd, offset, SEEK_SET) == -1)
-	{
-		close(fd);
-		respond(r, Eseek);
-		return;
-	}
+	lseek(fd, (off_t) offset, SEEK_SET);
 	r->ofcall.count = read(fd, r->ofcall.data, count);
 	close(fd);
 	respond(r, nil);
@@ -124,24 +144,18 @@ fswrite(Req *r)
 	vlong offset;
 	u32int count;
 	char *path;
-	struct stat st;
 	int fd;
 
 	f = r->fid->file;
 	path = tellpath(f);
-	if(path == NULL)
+	if(path == nil)
 	{
 		respond(r, Eunknown);
 		return;
 	}
-	if(stat(path, &st) == -1)
-	{
-		respond(r, Estat);
-		return;
-	}
 	offset = r->ifcall.offset;
 	count = r->ifcall.count;
-	if(offset + count > st.st_size || count == 0)
+	if(count == 0)
 	{
 		r->ofcall.count = 0;
 		respond(r, nil);
@@ -152,12 +166,7 @@ fswrite(Req *r)
 		respond(r, Eopen);
 		return;
 	}
-	if(lseek(fd, offset, SEEK_SET) == -1)
-	{
-		close(fd);
-		respond(r, Eseek);
-		return;
-	}
+	lseek(fd, (off_t) offset, SEEK_SET);
 	r->ofcall.count = write(fd, r->ifcall.data, count);
 	close(fd);
 	respond(r, nil);
@@ -176,12 +185,41 @@ fsremove(Req *r)
 }
 
 static void
+fsopen(Req *r)
+{
+	File *f;
+	char *path;
+	struct stat st;
+
+	f = r->fid->file;
+	if(f->dir.qid.type & QTDIR)
+	{
+		respond(r, nil);
+		return;
+	}
+	path = tellpath(f);
+	if(path == nil)
+	{
+		respond(r, Eunknown);
+		return;
+	}
+	if(stat(path, &st) == -1)
+	{
+		respond(r, Estat);
+		return;
+	}
+	f->dir.length = (vlong) st.st_size;
+	respond(r, nil);
+}
+
+static void
 fswstat(Req *r)
 {
 	respond(r, nil);
 }
 
 static Srv fs = {
+	.open=		fsopen,
 	.read=		fsread,
 	.write=		fswrite,
 	.create=	fscreate,
@@ -193,7 +231,7 @@ void
 usage(void)
 {
 	fprint(2, "usage: %s file ...\n", argv0);
-	exits("usage");
+	threadexits("usage");
 }
 
 void
@@ -208,5 +246,4 @@ threadmain(int argc, char *argv[])
 	buildpath(fs.tree->root, argv, argc);
 	srvname = "exportfd";
 	threadpostmountsrv(&fs, srvname, nil, MBEFORE);
-	threadmaybackground();
 }

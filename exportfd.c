@@ -19,6 +19,7 @@ static char Eopen[] = "cannot open file";
 static char Eseek[] = "cannot seek file";
 static char Eunknown[] = "unknown file";
 static char Eperm[] = "permission denied";
+static char Ewstat[] = "wstat not supported";
 
 static struct Entry top = {
 	"",
@@ -276,12 +277,61 @@ fsopen(Req *r)
 	respond(r, nil);
 }
 
+static void
+fswstat(Req *r)
+{
+	respond(r, Ewstat);
+}
+
+static void
+fsstat(Req *r)
+{
+	File *f;
+	char *path;
+	Dir *d;
+
+	f = r->fid->file;
+	path = tellpath(f);
+	if(path == nil)
+	{
+		respond(r, Eunknown);
+		return;
+	}
+	d = dirstat(path);
+	if(d == nil)
+	{
+		respond(r, Estat);
+		return;
+	}
+	/* sstat already duplicated r->d strings; free them before replacing. */
+	free(r->d.name);
+	free(r->d.uid);
+	free(r->d.gid);
+	free(r->d.muid);
+	free(r->d.ext);
+	memcpy(&r->d, d, sizeof r->d);
+	if(d->name != nil)
+		r->d.name = estrdup9p(d->name);
+	if(d->uid != nil)
+		r->d.uid = estrdup9p(d->uid);
+	if(d->gid != nil)
+		r->d.gid = estrdup9p(d->gid);
+	if(d->muid != nil)
+		r->d.muid = estrdup9p(d->muid);
+	if(d->ext != nil)
+		r->d.ext = estrdup9p(d->ext);
+	free(d);
+	respond(r, nil);
+}
+
 static Srv fs = {
 	.open=		fsopen,
 	.read=		fsread,
 	.write=		fswrite,
 	.create=	fscreate,
 	.remove=	fsremove,
+	.stat=		fsstat,
+	.wstat=		fswstat
 };
 
 static void

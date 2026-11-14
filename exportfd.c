@@ -5,6 +5,7 @@
 #include <9p.h>
 
 #include <sys/stat.h>
+#include <fcntl.h>
 
 struct Entry {
 	char *path;
@@ -32,7 +33,7 @@ threadmaybackground(void)
 	return 1;
 }
 
-char *
+static char *
 tellpath(File *f)
 {
 	struct Entry *node;
@@ -43,7 +44,7 @@ tellpath(File *f)
 	return nil;
 }
 
-void
+static void
 buildpath(File *root, char *vp[], int i)
 {
 	struct Entry **node;
@@ -63,7 +64,11 @@ buildpath(File *root, char *vp[], int i)
 			fprint(2, "%s: invalid file.\n", (*node)->path);
 			threadexits("invalid file");
 		}
-		(*node)->name = strrchr((*node)->path, '/') + 1;
+		(*node)->name = strrchr((*node)->path, '/');
+		if((*node)->name == nil)
+			(*node)->name = (*node)->path;
+		else
+			(*node)->name++;
 		node = &(*node)->next;
 	}
 	*node = &top;
@@ -81,23 +86,30 @@ buildpath(File *root, char *vp[], int i)
 		struct stat st;
 		int fd;
 
-		first->file = createfile(root,
-					 first->name,
-					 nil,
-					 0664,
-					 nil);
 		fd = open(first->path, O_RDONLY);
+		if(fd == -1)
+		{
+			fprint(2, "%s: cannot open file.\n", first->path);
+			continue;
+		}
 		if(lseek(fd, (off_t) 0, SEEK_CUR) == -1)
 		{
 			close(fd);
+			fprint(2, "%s: not a regular file.\n", first->path);
 			continue;
 		}
 		if(fstat(fd, &st) == -1)
 		{
 			close(fd);
+			fprint(2, "%s: cannot stat file.\n", first->path);
 			continue;
 		}
 		close(fd);
+		first->file = createfile(root,
+					 first->name,
+					 nil,
+					 0664,
+					 nil);
 		first->file->dir.length = (vlong) st.st_size;
 	}
 }
@@ -110,8 +122,15 @@ fsread(Req *r)
 	u32int count;
 	char *path;
 	int fd;
+	long n;
 
 	f = r->fid->file;
+	if(f->dir.qid.type & QTDIR)
+	{
+		r->ofcall.count = 0;
+		respond(r, nil);
+		return;
+	}
 	path = tellpath(f);
 	if(path == nil)
 	{
@@ -131,9 +150,20 @@ fsread(Req *r)
 		respond(r, Eopen);
 		return;
 	}
-	lseek(fd, (off_t) offset, SEEK_SET);
-	r->ofcall.count = read(fd, r->ofcall.data, count);
+	if(lseek(fd, (off_t) offset, SEEK_SET) == -1)
+	{
+		close(fd);
+		respond(r, Eseek);
+		return;
+	}
+	n = read(fd, r->ofcall.data, count);
 	close(fd);
+	if(n == -1)
+	{
+		respond(r, Eopen);
+		return;
+	}
+	r->ofcall.count = n;
 	respond(r, nil);
 }
 
@@ -145,6 +175,7 @@ fswrite(Req *r)
 	u32int count;
 	char *path;
 	int fd;
+	long n;
 
 	f = r->fid->file;
 	path = tellpath(f);
@@ -166,9 +197,20 @@ fswrite(Req *r)
 		respond(r, Eopen);
 		return;
 	}
-	lseek(fd, (off_t) offset, SEEK_SET);
-	r->ofcall.count = write(fd, r->ifcall.data, count);
+	if(lseek(fd, (off_t) offset, SEEK_SET) == -1)
+	{
+		close(fd);
+		respond(r, Eseek);
+		return;
+	}
+	n = write(fd, r->ifcall.data, count);
 	close(fd);
+	if(n == -1)
+	{
+		respond(r, Eopen);
+		return;
+	}
+	r->ofcall.count = n;
 	respond(r, nil);
 }
 
@@ -190,6 +232,7 @@ fsopen(Req *r)
 	File *f;
 	char *path;
 	struct stat st;
+	int mode;
 
 	f = r->fid->file;
 	if(f->dir.qid.type & QTDIR)
@@ -208,13 +251,28 @@ fsopen(Req *r)
 		respond(r, Estat);
 		return;
 	}
-	f->dir.length = (vlong) st.st_size;
-	respond(r, nil);
-}
+	mode = r->ifcall.mode & 3;
+	if(mode == O_WRONLY || mode == O_RDWR)
+	{
+		if((st.st_mode & 0222) == 0)
+		{
+			respond(r, Eperm);
+			return;
+		}
+	}
+	if(r->ifcall.mode & O_TRUNC)
+	{
+		int fd;
 
-static void
-fswstat(Req *r)
-{
+		if((fd = open(path, O_WRONLY|O_TRUNC)) == -1)
+		{
+			respond(r, Eopen);
+			return;
+		}
+		close(fd);
+		st.st_size = 0;
+	}
+	f->dir.length = (vlong) st.st_size;
 	respond(r, nil);
 }
 
@@ -224,10 +282,9 @@ static Srv fs = {
 	.write=		fswrite,
 	.create=	fscreate,
 	.remove=	fsremove,
-	.wstat=		fswstat
 };
 
-void
+static void
 usage(void)
 {
 	fprint(2, "usage: %s file ...\n", argv0);
